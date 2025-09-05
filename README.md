@@ -4,7 +4,7 @@ Video trimming UI for behavior recording videos
 
 ## Installation
 ### Option A — Run from source (Conda, Fast Execution)
-Requirements
+**Requirements**
 - Anaconda / Miniconda installed
 - **ffmpeg** must be installed and set in the **system environment variables**. (or ffmpeg exe file should be installed in SimpleVidCut directory)
 
