@@ -1,5 +1,7 @@
 # Simple-VidCut
-Video trimming UI for behavior recording videos
+Video trimming UI for behavior recording videos. You can cut the video to your desired settings with almost no delay and save it with a specific suffix.
+
+<img width="1102" height="752" alt="image" src="https://github.com/user-attachments/assets/9a613b41-acee-4ca6-ae38-ee814bd7cb28" />
 
 
 ## Installation
