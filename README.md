@@ -29,7 +29,7 @@ python SimpleVidCut.py
 
 ### Option B — Run the prebuilt app (Windows, Easy Installation)
 
-1. Download MBTI.zip from [drive](https://drive.google.com/file/d/1WtHEBoWNKgDINvH8BCLcWItzOH8xQzPP/view?usp=sharing) to any folder you like.
+1. Download MBTI.zip from [drive](https://drive.google.com/file/d/1Ki6NdweZ7u_TbvbWdH4pUA8GYBB71tYm/view?usp=sharing) to any folder you like.
 
 2. Extract the ZIP in that folder.
 Do not delete any files inside the extracted folder—the EXE needs the accompanying files to run.
