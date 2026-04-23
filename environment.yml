@@ -1,0 +1,10 @@
+name: simplevidcut
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - ffmpeg
+  - pyqt=5
+  - opencv
+  - numpy
+  - pip
