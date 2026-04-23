@@ -183,6 +183,7 @@ class ExportThread(QThread):
                 stderr=subprocess.PIPE,
                 text=True,
                 universal_newlines=True,
+                errors="replace",
                 bufsize=1,
             )
             self.progressChanged.emit(0)
@@ -235,6 +236,7 @@ class BatchExportThread(QThread):
                 stderr=subprocess.PIPE,
                 text=True,
                 universal_newlines=True,
+                errors="replace",
                 bufsize=1,
             )
             self.progressChanged.emit(0)
