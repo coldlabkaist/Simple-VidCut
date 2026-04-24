@@ -3,6 +3,9 @@
 Simple VidCut is a desktop app for trimming local video files with frame/time controls, bookmarks, and image adjustments.
 
 
+<img width="1102" height="752" alt="simple_vidcut_tutorial" src="https://github.com/user-attachments/assets/66305578-defb-4908-88eb-e4697f3de165" />
+
+
 ## Features
 - Video playback and scrubbing
 - Trim parameter modes:
