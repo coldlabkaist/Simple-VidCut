@@ -2,6 +2,7 @@
 
 Simple VidCut is a desktop app for trimming local video files with frame/time controls, bookmarks, and image adjustments.
 
+
 ## Features
 - Video playback and scrubbing
 - Trim parameter modes:
@@ -42,3 +43,6 @@ ffmpeg -version
 ```
 python SimpleVidCut.py
 ```
+
+## Quick Installation for Window (Unstable)
+EXE-based SimpleVidCut are being distributed though [Google Drive](https://drive.google.com/drive/folders/1__15POXg6eCWQqPr-MmVi8s96sfs3dA2?usp=sharing)
