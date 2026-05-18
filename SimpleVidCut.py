@@ -1,13 +1,18 @@
 import sys, os, shutil, subprocess, math
 from typing import Optional, List
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QEvent, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QIntValidator, QIcon, QColor, QKeySequence
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QEvent, QTimer, QRect, QSize
+from PyQt5.QtGui import QImage, QPixmap, QIntValidator, QIcon, QColor, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
     QListWidget, QPushButton, QLabel, QSlider, QFileDialog, QGroupBox, QLineEdit,
     QDoubleSpinBox, QSpinBox, QComboBox, QMessageBox, QSizePolicy, QCheckBox, QProgressBar,
     QRadioButton, QStyle, QDialog, QDialogButtonBox, QAbstractItemView, QShortcut
 )
+
+# Avoid OpenCV python-loader recursion in frozen executables (PyInstaller on Windows).
+if getattr(sys, "frozen", False):
+    os.environ.setdefault("OPENCV_SKIP_PYTHON_LOADER", "1")
+
 import cv2
 import numpy as np
 
@@ -161,6 +166,181 @@ class ClickJumpSlider(QSlider):
             self.setValue(val)
             ev.accept()
         super().mousePressEvent(ev)
+
+
+class CropPreviewWidget(QWidget):
+    cropSelectionFinished = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._frame = QImage()
+        self._crop_state = "off"
+        self._crop_rect = None
+        self._drag_start = None
+        self._drag_current = None
+        self._dragging = False
+        self._drag_threshold_px = 4
+        self.setMinimumSize(640, 360)
+        self.setMouseTracking(True)
+        self.setStyleSheet("background:#111;")
+
+    def sizeHint(self):
+        return QSize(640, 360)
+
+    def set_frame(self, image: QImage):
+        self._frame = image.copy() if image and not image.isNull() else QImage()
+        self.update()
+
+    def clear_frame(self):
+        self._frame = QImage()
+        self._clear_drag()
+        self.update()
+
+    def set_crop_state(self, state: str):
+        self._crop_state = state if state in ("off", "armed", "active") else "off"
+        if self._crop_state != "armed":
+            self._clear_drag()
+        self.setCursor(Qt.CrossCursor if self._crop_state == "armed" else Qt.ArrowCursor)
+        self.update()
+
+    def set_crop_rect(self, rect_norm):
+        self._crop_rect = rect_norm
+        self.update()
+
+    def _clear_drag(self):
+        self._dragging = False
+        self._drag_start = None
+        self._drag_current = None
+
+    def _content_rect(self) -> QRect:
+        if self._frame.isNull():
+            return QRect()
+        frame_w = self._frame.width()
+        frame_h = self._frame.height()
+        if frame_w <= 0 or frame_h <= 0 or self.width() <= 0 or self.height() <= 0:
+            return QRect()
+        scale = min(self.width() / frame_w, self.height() / frame_h)
+        draw_w = max(1, int(round(frame_w * scale)))
+        draw_h = max(1, int(round(frame_h * scale)))
+        left = (self.width() - draw_w) // 2
+        top = (self.height() - draw_h) // 2
+        return QRect(left, top, draw_w, draw_h)
+
+    def _event_xy(self, ev):
+        if hasattr(ev, "position"):
+            pos = ev.position()
+        else:
+            pos = ev.localPos()
+        return float(pos.x()), float(pos.y())
+
+    def _point_to_norm(self, x: float, y: float, clamp: bool):
+        rect = self._content_rect()
+        if not rect.isValid() or rect.width() <= 0 or rect.height() <= 0:
+            return None
+        nx = (x - rect.x()) / rect.width()
+        ny = (y - rect.y()) / rect.height()
+        if not clamp and not (0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0):
+            return None
+        return (
+            max(0.0, min(1.0, nx)),
+            max(0.0, min(1.0, ny)),
+        )
+
+    def _norm_rect_from_points(self, a, b):
+        if a is None or b is None:
+            return None
+        left = max(0.0, min(1.0, min(a[0], b[0])))
+        top = max(0.0, min(1.0, min(a[1], b[1])))
+        right = max(0.0, min(1.0, max(a[0], b[0])))
+        bottom = max(0.0, min(1.0, max(a[1], b[1])))
+        if right - left <= 1e-6 or bottom - top <= 1e-6:
+            return None
+        return (left, top, right, bottom)
+
+    def _norm_rect_to_widget_rect(self, rect_norm):
+        rect = self._content_rect()
+        if not rect.isValid() or rect.width() <= 0 or rect.height() <= 0 or not rect_norm:
+            return QRect()
+        left = rect.x() + int(round(rect_norm[0] * rect.width()))
+        top = rect.y() + int(round(rect_norm[1] * rect.height()))
+        right = rect.x() + int(round(rect_norm[2] * rect.width()))
+        bottom = rect.y() + int(round(rect_norm[3] * rect.height()))
+        return QRect(left, top, max(1, right - left), max(1, bottom - top))
+
+    def _drag_distance_large_enough(self):
+        rect = self._content_rect()
+        if not rect.isValid() or self._drag_start is None or self._drag_current is None:
+            return False
+        dx = abs(self._drag_current[0] - self._drag_start[0]) * rect.width()
+        dy = abs(self._drag_current[1] - self._drag_start[1]) * rect.height()
+        return max(dx, dy) >= self._drag_threshold_px
+
+    def _current_overlay_rect(self):
+        if self._dragging:
+            return self._norm_rect_from_points(self._drag_start, self._drag_current)
+        return self._crop_rect
+
+    def paintEvent(self, ev):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#111111"))
+        content = self._content_rect()
+        if not self._frame.isNull() and content.isValid():
+            painter.drawImage(content, self._frame)
+        else:
+            painter.setPen(QColor("#bbbbbb"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No video")
+
+        overlay = self._current_overlay_rect()
+        if content.isValid() and overlay:
+            crop_rect = self._norm_rect_to_widget_rect(overlay)
+            if crop_rect.isValid():
+                shade = QColor(0, 0, 0, 140)
+                painter.fillRect(QRect(content.left(), content.top(), content.width(), max(0, crop_rect.top() - content.top())), shade)
+                painter.fillRect(QRect(content.left(), crop_rect.bottom(), content.width(), max(0, content.bottom() - crop_rect.bottom() + 1)), shade)
+                painter.fillRect(QRect(content.left(), crop_rect.top(), max(0, crop_rect.left() - content.left()), crop_rect.height()), shade)
+                painter.fillRect(QRect(crop_rect.right(), crop_rect.top(), max(0, content.right() - crop_rect.right() + 1), crop_rect.height()), shade)
+                painter.setPen(QPen(Qt.white, 1))
+                painter.drawRect(crop_rect.adjusted(0, 0, -1, -1))
+
+        super().paintEvent(ev)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self._crop_state == "armed":
+            norm = self._point_to_norm(*self._event_xy(ev), clamp=False)
+            if norm is not None:
+                self._dragging = True
+                self._drag_start = norm
+                self._drag_current = norm
+                self.update()
+                ev.accept()
+                return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging:
+            norm = self._point_to_norm(*self._event_xy(ev), clamp=True)
+            if norm is not None:
+                self._drag_current = norm
+                self.update()
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.LeftButton and self._dragging:
+            norm = self._point_to_norm(*self._event_xy(ev), clamp=True)
+            if norm is not None:
+                self._drag_current = norm
+            rect_norm = None
+            if self._drag_distance_large_enough():
+                rect_norm = self._norm_rect_from_points(self._drag_start, self._drag_current)
+            self._clear_drag()
+            self.update()
+            if rect_norm is not None:
+                self.cropSelectionFinished.emit(rect_norm)
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
 
 
 class ExportThread(QThread):
@@ -317,6 +497,8 @@ class Cutter(QMainWindow):
         self.default_contrast_ui = 100
         self.default_brightness_ui = 0
         self.default_saturation_ui = 100
+        self.crop_state = "off"
+        self.crop_norm_rect = None
         self.loaded_video_name: Optional[str] = None
         self.export_thread: Optional[ExportThread] = None
         self.batch_export_thread: Optional[BatchExportThread] = None
@@ -325,11 +507,9 @@ class Cutter(QMainWindow):
         root = QWidget(self); self.setCentralWidget(root)
         G = QGridLayout(root); G.setContentsMargins(8,8,8,8); G.setSpacing(8)
 
-        self.video_label = QLabel("No video"); self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(640, 360)
-        self.video_label.setStyleSheet("background:#111; color:#bbb;")
+        self.video_preview = CropPreviewWidget(self)
         # (row=0, col=0) 2사분면
-        G.addWidget(self.video_label, 0, 0)
+        G.addWidget(self.video_preview, 0, 0)
 
         # playback panel
         play_group = QGroupBox("Playback")
@@ -377,6 +557,7 @@ class Cutter(QMainWindow):
         self.sld_saturation = ClickJumpSlider(Qt.Horizontal); self.sld_saturation.setRange(0, 200); self.sld_saturation.setValue(self.default_saturation_ui)
         self.spn_saturation = QSpinBox(); self.spn_saturation.setRange(0, 200); self.spn_saturation.setValue(self.default_saturation_ui); self.spn_saturation.setSuffix("%")
         self.btn_adjust_reset = QPushButton("Reset")
+        self.btn_crop = QPushButton("Crop")
 
         bmr.addWidget(QLabel("Contrast"),   0, 0)
         bmr.addWidget(self.sld_contrast,    0, 1)
@@ -387,7 +568,8 @@ class Cutter(QMainWindow):
         bmr.addWidget(QLabel("Saturation"), 2, 0)
         bmr.addWidget(self.sld_saturation,  2, 1)
         bmr.addWidget(self.spn_saturation,  2, 2)
-        bmr.addWidget(self.btn_adjust_reset, 3, 0, 1, 3)
+        bmr.addWidget(self.btn_adjust_reset, 3, 0)
+        bmr.addWidget(self.btn_crop, 3, 1, 1, 2)
 
         bmr.setColumnStretch(1, 1)
 
@@ -524,6 +706,7 @@ class Cutter(QMainWindow):
         self.btn_bm_add.clicked.connect(self.add_bookmark)
         self.btn_bm_go.clicked.connect(self.goto_bookmark)
         self.btn_bm_del.clicked.connect(self.del_bookmark)
+        self.video_preview.cropSelectionFinished.connect(self._on_crop_selection_finished)
         self.sld_contrast.valueChanged.connect(self.spn_contrast.setValue)
         self.spn_contrast.valueChanged.connect(self.sld_contrast.setValue)
         self.sld_brightness.valueChanged.connect(self.spn_brightness.setValue)
@@ -534,6 +717,7 @@ class Cutter(QMainWindow):
         self.sld_brightness.valueChanged.connect(lambda _: self._on_adjustment_changed())
         self.sld_saturation.valueChanged.connect(lambda _: self._on_adjustment_changed())
         self.btn_adjust_reset.clicked.connect(self.reset_adjustments)
+        self.btn_crop.clicked.connect(self.toggle_crop_mode)
 
         # param toggles
         self._param_state = 3  # 1: start+duration, 2: duration+end, 3: start+end
@@ -566,6 +750,7 @@ class Cutter(QMainWindow):
         self._apply_no_focus()
         self._apply_adjustment_focus_rules()
         self._sync_export_mode_for_adjustments()
+        self._update_crop_button()
 
         self.statusBar().showMessage("")
         self.status_progress = QProgressBar()
@@ -705,6 +890,133 @@ class Cutter(QMainWindow):
             sp.setFocusPolicy(Qt.NoFocus)
             sp.lineEdit().setFocusPolicy(Qt.ClickFocus)
         self.btn_adjust_reset.setFocusPolicy(Qt.NoFocus)
+        self.btn_crop.setFocusPolicy(Qt.NoFocus)
+
+    def _crop_active(self) -> bool:
+        return self.crop_state == "active" and self.crop_norm_rect is not None
+
+    def _normalize_crop_rect(self, rect_norm):
+        if not rect_norm:
+            return None
+        left = max(0.0, min(1.0, min(float(rect_norm[0]), float(rect_norm[2]))))
+        top = max(0.0, min(1.0, min(float(rect_norm[1]), float(rect_norm[3]))))
+        right = max(0.0, min(1.0, max(float(rect_norm[0]), float(rect_norm[2]))))
+        bottom = max(0.0, min(1.0, max(float(rect_norm[1]), float(rect_norm[3]))))
+        if right - left <= 1e-6 or bottom - top <= 1e-6:
+            return None
+        return (left, top, right, bottom)
+
+    def _validated_crop_rect_for_size(self, video_width: int, video_height: int, rect_norm=None):
+        rect_norm = self._normalize_crop_rect(rect_norm if rect_norm is not None else self.crop_norm_rect)
+        if rect_norm is None:
+            return None, "Crop canceled: invalid selection."
+        video_width = int(video_width)
+        video_height = int(video_height)
+        if video_width <= 1 or video_height <= 1:
+            return None, "Crop canceled: video size is unavailable."
+
+        left = max(0, min(int(round(rect_norm[0] * video_width)), video_width - 1))
+        top = max(0, min(int(round(rect_norm[1] * video_height)), video_height - 1))
+        right = max(left + 1, min(int(round(rect_norm[2] * video_width)), video_width))
+        bottom = max(top + 1, min(int(round(rect_norm[3] * video_height)), video_height))
+
+        if right - left < 4 or bottom - top < 4:
+            return None, "Crop canceled: selection is too small."
+
+        left_even = left + (left % 2)
+        top_even = top + (top % 2)
+        right_even = right - (right % 2)
+        bottom_even = bottom - (bottom % 2)
+        width = right_even - left_even
+        height = bottom_even - top_even
+        if width < 4 or height < 4:
+            return None, "Crop canceled: selection is too small."
+
+        return {"x": left_even, "y": top_even, "w": width, "h": height}, None
+
+    def _crop_filter_for_size(self, video_width: int, video_height: int):
+        if not self._crop_active():
+            return "", None
+        crop_rect, err = self._validated_crop_rect_for_size(video_width, video_height)
+        if err:
+            return "", err
+        return f"crop={crop_rect['w']}:{crop_rect['h']}:{crop_rect['x']}:{crop_rect['y']}", None
+
+    def _update_crop_button(self):
+        if self.crop_state == "armed":
+            self.btn_crop.setText("Cancel Crop")
+            self.btn_crop.setToolTip("Exit crop selection mode without applying a crop.")
+        elif self._crop_active():
+            self.btn_crop.setText("Reset Crop")
+            self.btn_crop.setToolTip("Remove the current crop selection.")
+        else:
+            self.btn_crop.setText("Crop")
+            self.btn_crop.setToolTip("Enter crop selection mode.")
+        self.video_preview.set_crop_rect(self.crop_norm_rect)
+        self.video_preview.set_crop_state(self.crop_state)
+
+    def _set_crop_state(self, state: str):
+        self.crop_state = state if state in ("off", "armed", "active") else "off"
+        if self.crop_state != "active":
+            self.crop_norm_rect = None
+        self._update_crop_button()
+        self._sync_export_mode_for_adjustments()
+
+    def _clear_crop_selection(self, status_text: str = "", auto_clear_ms: int = 5000):
+        self.crop_norm_rect = None
+        self.crop_state = "off"
+        self._update_crop_button()
+        self._sync_export_mode_for_adjustments()
+        if status_text:
+            self._set_export_status(status_text, auto_clear_ms=auto_clear_ms)
+
+    def _activate_crop_selection(self, rect_norm, status_text: str = ""):
+        rect_norm = self._normalize_crop_rect(rect_norm)
+        if rect_norm is None:
+            return
+        self.crop_norm_rect = rect_norm
+        self.crop_state = "active"
+        self._update_crop_button()
+        self._sync_export_mode_for_adjustments()
+        if status_text:
+            self._set_export_status(status_text, auto_clear_ms=4000)
+
+    def _revalidate_crop_for_current_video(self, status_text: str = ""):
+        if not self._crop_active():
+            return True
+        _, err = self._validated_crop_rect_for_size(self.video_width, self.video_height)
+        if err:
+            self._clear_crop_selection(status_text or err)
+            return False
+        self.video_preview.set_crop_rect(self.crop_norm_rect)
+        return True
+
+    def toggle_crop_mode(self):
+        if not self.video_path:
+            self._set_export_status("Load a video before using crop.", auto_clear_ms=4000)
+            return
+        if self.crop_state == "off":
+            self.crop_state = "armed"
+            self._update_crop_button()
+            self._sync_export_mode_for_adjustments()
+            self._set_export_status("Crop mode: drag on the preview to select an area.", auto_clear_ms=5000)
+            return
+        if self.crop_state == "armed":
+            self._clear_crop_selection("Crop selection canceled.")
+            return
+        self._clear_crop_selection("Crop reset.")
+
+    def _on_crop_selection_finished(self, rect_norm):
+        if self.crop_state != "armed":
+            return
+        crop_rect, err = self._validated_crop_rect_for_size(self.video_width, self.video_height, rect_norm)
+        if err:
+            self._clear_crop_selection(err)
+            return
+        self._activate_crop_selection(
+            rect_norm,
+            f"Crop applied: {crop_rect['w']}x{crop_rect['h']} at ({crop_rect['x']}, {crop_rect['y']})."
+        )
 
     def _current_adjustments(self):
         contrast = self.sld_contrast.value() / 100.0
@@ -716,6 +1028,9 @@ class Cutter(QMainWindow):
         contrast, brightness, saturation = self._current_adjustments()
         return abs(contrast - 1.0) > 1e-6 or abs(brightness) > 1e-6 or abs(saturation - 1.0) > 1e-6
 
+    def _visual_filters_active(self) -> bool:
+        return self._adjustments_active() or self._crop_active()
+
     def _ffmpeg_eq_filter(self) -> str:
         contrast, brightness, saturation = self._current_adjustments()
         return f"eq=contrast={contrast:.3f}:brightness={brightness:.3f}:saturation={saturation:.3f}"
@@ -725,11 +1040,11 @@ class Cutter(QMainWindow):
             self.rad_accurate.setEnabled(False)
             self.rad_fast.setEnabled(False)
             return
-        if self._adjustments_active():
+        if self._visual_filters_active():
             if not self.rad_accurate.isChecked():
                 self.rad_accurate.setChecked(True)
             self.rad_fast.setEnabled(False)
-            self.rad_fast.setToolTip("When image adjustments are enabled, only Accurate mode is available.")
+            self.rad_fast.setToolTip("When image adjustments or crop are enabled, only Accurate mode is available.")
         else:
             self.rad_accurate.setEnabled(True)
             self.rad_fast.setEnabled(True)
@@ -893,7 +1208,7 @@ class Cutter(QMainWindow):
                   self.btn_bm_add, self.btn_bm_go, self.btn_bm_del, self.bm_list,
                   self.sld_contrast, self.sld_brightness, self.sld_saturation,
                   self.spn_contrast, self.spn_brightness, self.spn_saturation,
-                  self.btn_adjust_reset):
+                  self.btn_adjust_reset, self.btn_crop):
             w.setEnabled(video_loaded)
 
         # enforce the 2-of-3 rule even when enabling
@@ -967,6 +1282,10 @@ class Cutter(QMainWindow):
         self.is_playing = False
         self.btn_play.setText("Play")
         self._apply_mode_values_on_video_load()
+        if self.crop_state == "armed":
+            self._clear_crop_selection()
+        else:
+            self._revalidate_crop_for_current_video("Crop canceled: selection is too small for this video.")
 
         # connect signals
         self.thread.frameReady.connect(self.on_frame)
@@ -991,14 +1310,11 @@ class Cutter(QMainWindow):
         self.slider.blockSignals(True)
         self.slider.setValue(idx)
         self.slider.blockSignals(False)
-        self.video_label.setPixmap(QPixmap.fromImage(qimg).scaled(
-            self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.video_preview.set_frame(qimg)
         self.update_labels()
 
     def resizeEvent(self, e):
-        # keep aspect ratio on label resize; request current frame again
-        if self.thread:
-            self.thread.seek(self.current_frame)
+        self.video_preview.update()
         super().resizeEvent(e)
 
     def on_video_finished(self):
@@ -1270,8 +1586,15 @@ class Cutter(QMainWindow):
         out_name = f"{prefix_part}{base}{suffix_part}{ext}"
         return os.path.join(folder, out_name)
 
-    def _build_export_command(self, ffmpeg: str, video_path: str, out_path: str, start_sec: float, dur_sec: float):
+    def _build_export_command(self, ffmpeg: str, video_path: str, out_path: str, start_sec: float, dur_sec: float, video_width: int, video_height: int):
         adjustments_active = self._adjustments_active()
+        crop_filter, _ = self._crop_filter_for_size(video_width, video_height)
+        vf_parts = []
+        if crop_filter:
+            vf_parts.append(crop_filter)
+        if adjustments_active:
+            vf_parts.append(self._ffmpeg_eq_filter())
+        filters_active = bool(vf_parts)
         progress_args = ["-progress", "pipe:2", "-nostats"]
 
         fast_cmd = [
@@ -1292,8 +1615,8 @@ class Cutter(QMainWindow):
             "-i", video_path,
             "-t", f"{dur_sec:.6f}",
         ]
-        if adjustments_active:
-            accurate_cmd.extend(["-vf", self._ffmpeg_eq_filter()])
+        if filters_active:
+            accurate_cmd.extend(["-vf", ",".join(vf_parts)])
         accurate_cmd.extend([
             "-c:v", "libx264",
             "-preset", "medium",
@@ -1306,7 +1629,7 @@ class Cutter(QMainWindow):
         ])
 
         mode = "accurate" if self.rad_accurate.isChecked() else "fast"
-        if adjustments_active and mode.startswith("fast"):
+        if filters_active and mode.startswith("fast"):
             mode = "accurate"
         return (accurate_cmd if mode.startswith("accurate") else fast_cmd), mode
 
@@ -1317,8 +1640,10 @@ class Cutter(QMainWindow):
         try:
             fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
             fps = float(fps) if fps > 1e-3 else 30.0
-            return fps, total
+            return fps, total, width, height
         finally:
             cap.release()
 
@@ -1448,6 +1773,7 @@ class Cutter(QMainWindow):
             return
 
         tasks: List[dict] = []
+        prepared_items: List[dict] = []
         prep_errors: List[str] = []
         existing_out_paths: List[str] = []
         any_truncated = False
@@ -1461,7 +1787,7 @@ class Cutter(QMainWindow):
             if not meta:
                 prep_errors.append(f"{name}: failed to read video metadata.")
                 continue
-            fps, total_frames = meta
+            fps, total_frames, video_width, video_height = meta
             res, err = self._resolve_cut_params_for_video(fps, total_frames)
             if err:
                 prep_errors.append(f"{name}: {err}")
@@ -1471,20 +1797,46 @@ class Cutter(QMainWindow):
             any_truncated = any_truncated or bool(res.get("duration_truncated", False))
 
             out_path = self._make_output_path(video_path)
-            cmd, _ = self._build_export_command(ffmpeg, video_path, out_path, start_sec, dur_sec)
-            tasks.append({
-                "cmd": cmd,
+            prepared_items.append({
+                "video_path": video_path,
+                "video_width": video_width,
+                "video_height": video_height,
+                "start_sec": start_sec,
+                "dur_sec": dur_sec,
                 "out_path": out_path,
-                "duration_us": max(1, int(max(0.001, float(dur_sec)) * 1_000_000.0)),
                 "label": os.path.basename(video_path),
             })
             if os.path.exists(out_path):
                 existing_out_paths.append(out_path)
 
-        if not tasks:
+        if not prepared_items:
             details = "\n".join(prep_errors[:10])
             QMessageBox.warning(self, "Batch export", f"No valid videos to process.\n\n{details}")
             return
+
+        if self._crop_active():
+            for item in prepared_items:
+                _, crop_err = self._crop_filter_for_size(item["video_width"], item["video_height"])
+                if crop_err:
+                    self._clear_crop_selection("Crop canceled: selection is too small for one or more videos.")
+                    break
+
+        for item in prepared_items:
+            cmd, _ = self._build_export_command(
+                ffmpeg,
+                item["video_path"],
+                item["out_path"],
+                item["start_sec"],
+                item["dur_sec"],
+                item["video_width"],
+                item["video_height"],
+            )
+            tasks.append({
+                "cmd": cmd,
+                "out_path": item["out_path"],
+                "duration_us": max(1, int(max(0.001, float(item["dur_sec"])) * 1_000_000.0)),
+                "label": item["label"],
+            })
 
         if prep_errors:
             details = "\n".join(prep_errors[:8])
@@ -1541,6 +1893,10 @@ class Cutter(QMainWindow):
         dur_sec = res["dur_sec"]
         if res.get("duration_truncated", False):
             self._set_export_status(self.duration_warning_text)
+        if self._crop_active():
+            _, crop_err = self._crop_filter_for_size(self.video_width, self.video_height)
+            if crop_err:
+                self._clear_crop_selection(crop_err)
 
         out_path = self._make_output_path(self.video_path)
 
@@ -1556,7 +1912,15 @@ class Cutter(QMainWindow):
 
         QApplication.processEvents()
 
-        cmd, mode = self._build_export_command(ffmpeg, self.video_path, out_path, start_sec, dur_sec)
+        cmd, mode = self._build_export_command(
+            ffmpeg,
+            self.video_path,
+            out_path,
+            start_sec,
+            dur_sec,
+            self.video_width,
+            self.video_height,
+        )
         if mode.startswith("accurate"):
             _, encode_time, slowdown = self._estimate_cut_walltime(dur_sec)
             self._set_export_status(
