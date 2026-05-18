@@ -13,10 +13,11 @@ Simple VidCut is a desktop app for trimming local video files with frame/time co
   - `Duration + End`
   - `Start + End` (default)
 - Export modes:
-  - `accurate (re-encode)` for precise cut points
-  - `fast (stream copy)` for faster export (keyframe-aligned)
+  - `accurate (re-encode)` for analysis video / precise cut
+  - `fast (stream copy)` for faster export 
 - Single export: `Save Current Video`
 - Batch export: `Save Videos...` (multi-select with Ctrl/Shift/Ctrl+A)
+- Video crop
 - Image adjustments: contrast, brightness, saturation (applied to preview and export)
 
 ## Requirements
