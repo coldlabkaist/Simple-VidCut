@@ -181,6 +181,7 @@ class CropPreviewWidget(QWidget):
         self._dragging = False
         self._drag_threshold_px = 4
         self.setMinimumSize(640, 360)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
         self.setStyleSheet("background:#111;")
 
@@ -499,6 +500,7 @@ class Cutter(QMainWindow):
         self.default_saturation_ui = 100
         self.crop_state = "off"
         self.crop_norm_rect = None
+        self.export_folder_override = ""
         self.loaded_video_name: Optional[str] = None
         self.export_thread: Optional[ExportThread] = None
         self.batch_export_thread: Optional[BatchExportThread] = None
@@ -513,7 +515,11 @@ class Cutter(QMainWindow):
 
         # playback panel
         play_group = QGroupBox("Playback")
+        play_group.setMinimumHeight(110)
         gp = QGridLayout(play_group)
+        gp.setContentsMargins(4, 8, 4, 4)
+        gp.setHorizontalSpacing(6)
+        gp.setVerticalSpacing(4)
 
         self.btn_play = QPushButton("Play"); self.btn_play.setEnabled(False)
         self.slider = ClickJumpSlider(Qt.Horizontal); self.slider.setEnabled(False)
@@ -534,7 +540,7 @@ class Cutter(QMainWindow):
         # bookmarks panel
         bm_group = QGroupBox("Bookmarks")
         bml = QHBoxLayout(bm_group)
-        bml.setContentsMargins(6, 6, 6, 6)
+        bml.setContentsMargins(4, 8, 4, 4)
         self.btn_bm_add = QPushButton("Add")
         self.btn_bm_go  = QPushButton("Go")
         self.btn_bm_del = QPushButton("Delete")
@@ -546,9 +552,9 @@ class Cutter(QMainWindow):
         # image adjustments panel
         adj_group = QGroupBox("Image Adjustments")
         bmr = QGridLayout(adj_group)
-        bmr.setContentsMargins(6, 6, 6, 6)
-        bmr.setHorizontalSpacing(8)
-        bmr.setVerticalSpacing(6)
+        bmr.setContentsMargins(4, 6, 4, 4)
+        bmr.setHorizontalSpacing(6)
+        bmr.setVerticalSpacing(2)
 
         self.sld_contrast = ClickJumpSlider(Qt.Horizontal); self.sld_contrast.setRange(0, 200); self.sld_contrast.setValue(self.default_contrast_ui)
         self.spn_contrast = QSpinBox(); self.spn_contrast.setRange(0, 200); self.spn_contrast.setValue(self.default_contrast_ui); self.spn_contrast.setSuffix("%")
@@ -557,7 +563,6 @@ class Cutter(QMainWindow):
         self.sld_saturation = ClickJumpSlider(Qt.Horizontal); self.sld_saturation.setRange(0, 200); self.sld_saturation.setValue(self.default_saturation_ui)
         self.spn_saturation = QSpinBox(); self.spn_saturation.setRange(0, 200); self.spn_saturation.setValue(self.default_saturation_ui); self.spn_saturation.setSuffix("%")
         self.btn_adjust_reset = QPushButton("Reset")
-        self.btn_crop = QPushButton("Crop")
 
         bmr.addWidget(QLabel("Contrast"),   0, 0)
         bmr.addWidget(self.sld_contrast,    0, 1)
@@ -568,10 +573,24 @@ class Cutter(QMainWindow):
         bmr.addWidget(QLabel("Saturation"), 2, 0)
         bmr.addWidget(self.sld_saturation,  2, 1)
         bmr.addWidget(self.spn_saturation,  2, 2)
-        bmr.addWidget(self.btn_adjust_reset, 3, 0)
-        bmr.addWidget(self.btn_crop, 3, 1, 1, 2)
+        bmr.addWidget(self.btn_adjust_reset, 3, 0, 1, 3)
 
         bmr.setColumnStretch(1, 1)
+
+        crop_group = QGroupBox("Crop")
+        crop_group.setMinimumWidth(330)
+        crop_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        gcr = QGridLayout(crop_group)
+        gcr.setContentsMargins(4, 8, 4, 4)
+        gcr.setHorizontalSpacing(6)
+        gcr.setVerticalSpacing(4)
+        self.btn_crop = QPushButton("Crop")
+        self.lbl_crop_status = QLabel("Off")
+        self.lbl_crop_status.setStyleSheet("color: #4c566a;")
+        self.lbl_crop_status.setWordWrap(True)
+        gcr.addWidget(self.btn_crop, 0, 0)
+        gcr.addWidget(self.lbl_crop_status, 0, 1)
+        gcr.setColumnStretch(1, 1)
 
         # right: file list + cut params + run
         file_group = QGroupBox("Video Files")
@@ -583,9 +602,12 @@ class Cutter(QMainWindow):
         gf.addWidget(self.btn_open); gf.addWidget(self.list_videos); gf.addWidget(self.btn_load)
         G.addWidget(file_group, 0, 1)
 
-        cut_group = QGroupBox("Cut Parameters")
+        cut_group = QGroupBox("Clip Parameters")
         cut_group.setMinimumWidth(330)
         gc = QGridLayout(cut_group)
+        gc.setContentsMargins(4, 6, 4, 4)
+        gc.setHorizontalSpacing(6)
+        gc.setVerticalSpacing(4)
 
         # checkboxes
         self.chk_start = QCheckBox("Start")
@@ -630,7 +652,6 @@ class Cutter(QMainWindow):
         self.ed_end.setPlaceholderText("(frame)") 
         gc.addWidget(self.btn_end_from_cur,    3, 3)
         gc.addWidget(self.lbl_end_time,        3, 4)
-
         # suffix + run
         run_group = QGroupBox("Export")
         run_group.setMinimumWidth(330)
@@ -639,6 +660,10 @@ class Cutter(QMainWindow):
         self.ed_suffix = QLineEdit("cut")
         self.btn_cut = QPushButton("Save Current Video")
         self.btn_cut_multi = QPushButton("Save Videos...")
+        self.btn_export_dir = QPushButton("Save at")
+        self.lbl_export_dir = QLabel("-")
+        self.lbl_export_dir.setStyleSheet("color: #4c566a;")
+        self.lbl_export_dir.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.rad_accurate = QRadioButton("accurate (re-encode)")
         self.rad_fast = QRadioButton("fast (stream copy)")
         self.rad_accurate.setChecked(True)
@@ -650,35 +675,59 @@ class Cutter(QMainWindow):
         mode_row_l.addWidget(self.rad_fast)
         mode_row_l.addStretch(1)
         self._apply_cut_mode_tooltips()
-        ge.addWidget(QLabel("Prefix:"), 0, 0)
-        ge.addWidget(self.ed_prefix,    0, 1)
-        ge.addWidget(QLabel("Suffix:"), 0, 2)
-        ge.addWidget(self.ed_suffix,    0, 3)
-        ge.addWidget(mode_row,          1, 0, 1, 4)
+        dir_row = QWidget()
+        dir_row_l = QHBoxLayout(dir_row)
+        dir_row_l.setContentsMargins(0, 0, 0, 0)
+        dir_row_l.setSpacing(6)
+        dir_row_l.addWidget(self.btn_export_dir)
+        dir_row_l.addWidget(self.lbl_export_dir, 1)
+        ge.addWidget(dir_row,           0, 0, 1, 4)
+        ge.addWidget(QLabel("Prefix:"), 1, 0)
+        ge.addWidget(self.ed_prefix,    1, 1)
+        ge.addWidget(QLabel("Suffix:"), 1, 2)
+        ge.addWidget(self.ed_suffix,    1, 3)
+        ge.addWidget(mode_row,          2, 0, 1, 4)
         export_btn_row = QWidget()
         export_btn_row_l = QHBoxLayout(export_btn_row)
         export_btn_row_l.setContentsMargins(0, 0, 0, 0)
         export_btn_row_l.setSpacing(8)
         export_btn_row_l.addWidget(self.btn_cut)
         export_btn_row_l.addWidget(self.btn_cut_multi)
-        ge.addWidget(export_btn_row, 2, 0, 1, 4)
+        ge.addWidget(export_btn_row, 3, 0, 1, 4)
 
         # 3사분면: Playback + Bookmarks
         bottom_left = QWidget(); bl = QVBoxLayout(bottom_left); bl.setContentsMargins(0,0,0,0); bl.setSpacing(8)
         bl.addWidget(play_group)
         tools_row = QWidget()
         tr = QHBoxLayout(tools_row); tr.setContentsMargins(0, 0, 0, 0); tr.setSpacing(8)
-        tr.addWidget(adj_group, 1)
-        tr.addWidget(cut_group, 1)
+        left_tools = QWidget()
+        ltl = QVBoxLayout(left_tools); ltl.setContentsMargins(0, 0, 0, 0); ltl.setSpacing(8)
+        ltl.addWidget(adj_group)
+        ltl.addStretch(1)
+        right_tools = QWidget()
+        rtl = QVBoxLayout(right_tools); rtl.setContentsMargins(0, 0, 0, 0); rtl.setSpacing(0)
+        rtl.addWidget(cut_group)
+        rtl.addStretch(1)
+        tr.addWidget(left_tools, 1)
+        tr.addWidget(right_tools, 1)
         bl.addWidget(tools_row)
-        bm_group.setMaximumHeight(140)
-        adj_group.setMaximumHeight(220)
+        play_group.setMinimumHeight(120)
+        play_group.setMaximumHeight(120)
+        bm_group.setMinimumHeight(120)
+        bm_group.setMaximumHeight(120)
+        adj_group.setMinimumHeight(166)
+        adj_group.setMaximumHeight(166)
+        cut_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        cut_group.setMinimumHeight(166)
+        cut_group.setMaximumHeight(166)
         G.addWidget(bottom_left, 1, 0)
 
         # 4사분면
         bottom_right = QWidget(); br = QVBoxLayout(bottom_right); br.setContentsMargins(0,0,0,0); br.setSpacing(8)
         br.addWidget(bm_group)
+        br.addWidget(crop_group)
         br.addWidget(run_group)
+        br.addStretch(1)
         G.addWidget(bottom_right, 1, 1)
 
         # 스트레치: (행) 위쪽 크게, (열) 오른쪽(비디오) 크게
@@ -686,7 +735,9 @@ class Cutter(QMainWindow):
         G.setRowStretch(1, 0)   # 하단(플레이/북마크 + 컷) 비중
         G.setColumnStretch(0, 5)  # 좌(비디오/플레이)
         G.setColumnStretch(1, 1)  # 우(리스트/컷)
-        self._apply_panel_styles(play_group, bm_group, adj_group, file_group, cut_group, run_group)
+        G.setRowStretch(0, 1)
+        G.setRowStretch(1, 0)
+        self._apply_panel_styles(play_group, bm_group, adj_group, crop_group, file_group, cut_group, run_group)
         self._apply_slider_styles()
         self._apply_video_list_styles()
 
@@ -718,11 +769,10 @@ class Cutter(QMainWindow):
         self.sld_saturation.valueChanged.connect(lambda _: self._on_adjustment_changed())
         self.btn_adjust_reset.clicked.connect(self.reset_adjustments)
         self.btn_crop.clicked.connect(self.toggle_crop_mode)
+        self.btn_export_dir.clicked.connect(self.choose_export_folder)
 
         # param toggles
-        self._param_state = 3  # 1: start+duration, 2: duration+end, 3: start+end
         # 초기 상태 강제(혹시 UI 초기값이 어긋나 있어도 맞춤)
-        QTimer.singleShot(0, lambda: self._apply_state(self._param_state))
         # 클릭(토글) 이벤트를 상태머신 입력으로 사용
         self._param_state = 3  # 1: Start+Duration, 2: Duration+End, 3: Start+End
         QTimer.singleShot(0, lambda: self._apply_state(self._param_state))
@@ -751,6 +801,7 @@ class Cutter(QMainWindow):
         self._apply_adjustment_focus_rules()
         self._sync_export_mode_for_adjustments()
         self._update_crop_button()
+        self._update_export_dir_label()
 
         self.statusBar().showMessage("")
         self.status_progress = QProgressBar()
@@ -891,6 +942,38 @@ class Cutter(QMainWindow):
             sp.lineEdit().setFocusPolicy(Qt.ClickFocus)
         self.btn_adjust_reset.setFocusPolicy(Qt.NoFocus)
         self.btn_crop.setFocusPolicy(Qt.NoFocus)
+        self.btn_export_dir.setFocusPolicy(Qt.NoFocus)
+
+    def _source_video_folder(self, video_path: Optional[str] = None) -> str:
+        path = video_path or self.video_path
+        if path:
+            return os.path.dirname(path)
+        return self.video_folder or ""
+
+    def _effective_export_folder(self, video_path: Optional[str] = None) -> str:
+        return self.export_folder_override or self._source_video_folder(video_path)
+
+    def _update_export_dir_label(self):
+        folder = self._effective_export_folder()
+        if folder:
+            stem = os.path.basename(os.path.normpath(folder)) or folder
+            self.lbl_export_dir.setText(stem)
+            self.lbl_export_dir.setToolTip(folder)
+        else:
+            self.lbl_export_dir.setText("-")
+            self.lbl_export_dir.setToolTip("")
+
+    def choose_export_folder(self):
+        start_dir = self._effective_export_folder() or os.getcwd()
+        path = QFileDialog.getExistingDirectory(self, "Select Save Folder", start_dir)
+        if not path:
+            return
+        source_folder = self._source_video_folder()
+        normalized_path = os.path.normcase(os.path.normpath(path))
+        normalized_source = os.path.normcase(os.path.normpath(source_folder)) if source_folder else ""
+        self.export_folder_override = "" if normalized_source and normalized_path == normalized_source else path
+        self._update_export_dir_label()
+        self._set_export_status(f"Save folder: {self._effective_export_folder()}", auto_clear_ms=5000)
 
     def _crop_active(self) -> bool:
         return self.crop_state == "active" and self.crop_norm_rect is not None
@@ -946,21 +1029,21 @@ class Cutter(QMainWindow):
         if self.crop_state == "armed":
             self.btn_crop.setText("Cancel Crop")
             self.btn_crop.setToolTip("Exit crop selection mode without applying a crop.")
+            self.lbl_crop_status.setText("Select on preview")
         elif self._crop_active():
             self.btn_crop.setText("Reset Crop")
             self.btn_crop.setToolTip("Remove the current crop selection.")
+            crop_rect, err = self._validated_crop_rect_for_size(self.video_width, self.video_height)
+            self.lbl_crop_status.setText(
+                f"{crop_rect['w']}x{crop_rect['h']} @ {crop_rect['x']},{crop_rect['y']}"
+                if crop_rect and not err else "Crop active"
+            )
         else:
             self.btn_crop.setText("Crop")
             self.btn_crop.setToolTip("Enter crop selection mode.")
+            self.lbl_crop_status.setText("Off")
         self.video_preview.set_crop_rect(self.crop_norm_rect)
         self.video_preview.set_crop_state(self.crop_state)
-
-    def _set_crop_state(self, state: str):
-        self.crop_state = state if state in ("off", "armed", "active") else "off"
-        if self.crop_state != "active":
-            self.crop_norm_rect = None
-        self._update_crop_button()
-        self._sync_export_mode_for_adjustments()
 
     def _clear_crop_selection(self, status_text: str = "", auto_clear_ms: int = 5000):
         self.crop_norm_rect = None
@@ -1202,6 +1285,8 @@ class Cutter(QMainWindow):
                   self.rad_accurate, self.rad_fast,
                   self.combo_mode):
             w.setEnabled(enable_right)
+        self.btn_export_dir.setEnabled(folder_loaded)
+        self.lbl_export_dir.setEnabled(folder_loaded)
 
         # playback + bookmarks
         for w in (self.btn_play, self.slider, self.speed,
@@ -1219,6 +1304,7 @@ class Cutter(QMainWindow):
         else:
             self.rad_accurate.setEnabled(False)
             self.rad_fast.setEnabled(False)
+        self._update_export_dir_label()
 
     # ----------------------------- file ops -----------------------------
     def open_folder(self):
@@ -1234,6 +1320,7 @@ class Cutter(QMainWindow):
         self.list_videos.addItems(files)
         self._refresh_loaded_video_highlight()
         self.update_enable_state(folder_loaded=True, video_loaded=False)
+        self._update_export_dir_label()
 
     def _apply_mode_values_on_video_load(self):
         last_frame = max(0, self.total_frames - 1)
@@ -1567,9 +1654,6 @@ class Cutter(QMainWindow):
         found = shutil.which("ffmpeg")
         return found or ""
 
-    def _ffmpeg_exists(self) -> bool:
-        return bool(self._find_ffmpeg())
-
     def _is_export_running(self) -> bool:
         return bool(
             (self.export_thread and self.export_thread.isRunning())
@@ -1577,7 +1661,7 @@ class Cutter(QMainWindow):
         )
 
     def _make_output_path(self, video_path: str) -> str:
-        folder = os.path.dirname(video_path)
+        folder = self._effective_export_folder(video_path) or os.path.dirname(video_path)
         base, ext = os.path.splitext(os.path.basename(video_path))
         prefix = self.ed_prefix.text().strip().strip("_")
         suffix = self.ed_suffix.text().strip().strip("_")
