@@ -621,8 +621,8 @@ class Cutter(QMainWindow):
 
         # mode combo box (Start+Duration / Duration+End / Start+End)
         self.combo_mode = QComboBox()
-        self.combo_mode.addItems(["Start + Duration", "Duration + End", "Start + End"])
-        self.combo_mode.setCurrentIndex(2)  # default: state3 (Start + End)
+        self.combo_mode.addItems(["No Clip", "Start + Duration", "Duration + End", "Start + End"])
+        self.combo_mode.setCurrentIndex(0)  # default: no clip
         gc.addWidget(QLabel("Mode:"), 0, 0)
         gc.addWidget(self.combo_mode, 0, 1, 1, 4)
 
@@ -774,7 +774,7 @@ class Cutter(QMainWindow):
         # param toggles
         # 초기 상태 강제(혹시 UI 초기값이 어긋나 있어도 맞춤)
         # 클릭(토글) 이벤트를 상태머신 입력으로 사용
-        self._param_state = 3  # 1: Start+Duration, 2: Duration+End, 3: Start+End
+        self._param_state = 0  # 0: No Clip, 1: Start+Duration, 2: Duration+End, 3: Start+End
         QTimer.singleShot(0, lambda: self._apply_state(self._param_state))
         self.combo_mode.currentIndexChanged.connect(self.on_mode_changed)
         self.ed_start.textChanged.connect(lambda _: self._on_cut_param_changed())
@@ -1195,7 +1195,7 @@ class Cutter(QMainWindow):
         self.unit_dur.setToolTip(tooltip)
 
     def _duration_may_truncate(self) -> bool:
-        state = getattr(self, "_param_state", 1)
+        state = getattr(self, "_param_state", 0)
         if state not in (1, 2):
             return False
         total_sec = self.video_duration_sec()
@@ -1297,7 +1297,7 @@ class Cutter(QMainWindow):
             w.setEnabled(video_loaded)
 
         # enforce the 2-of-3 rule even when enabling
-        self._apply_state(getattr(self, "_param_state", 1))
+        self._apply_state(getattr(self, "_param_state", 0))
         self._on_cut_param_changed()
         if video_loaded:
             self._sync_export_mode_for_adjustments()
@@ -1324,7 +1324,10 @@ class Cutter(QMainWindow):
 
     def _apply_mode_values_on_video_load(self):
         last_frame = max(0, self.total_frames - 1)
-        state = getattr(self, "_param_state", 1)
+        state = getattr(self, "_param_state", 0)
+
+        if state == 0:
+            return
 
         # In Start+End mode, always reset to the full span of the newly loaded video.
         if state == 3:
@@ -1499,10 +1502,14 @@ class Cutter(QMainWindow):
 
     # --------------------------- cut parameters ---------------------------
     def _apply_state(self, state: int):
-        """state: 1=start+duration, 2=duration+end, 3=start+end"""
+        """state: 0=no clip, 1=start+duration, 2=duration+end, 3=start+end"""
         def _set(box, val):
             box.blockSignals(True); box.setChecked(val); box.blockSignals(False)
-        if state == 1:   # start+duration
+        if state == 0:   # no clip
+            _set(self.chk_start, False)
+            _set(self.chk_dur,   False)
+            _set(self.chk_end,   False)
+        elif state == 1:   # start+duration
             _set(self.chk_start, True)
             _set(self.chk_dur,   True)
             _set(self.chk_end,   False)
@@ -1524,15 +1531,15 @@ class Cutter(QMainWindow):
         self._enable_param_row('dur',   state in (1, 2))
         self._enable_param_row('end',   state in (2, 3))
         # 콤보 표시와 내부 상태 동기화
-        combo_idx = {1:0, 2:1, 3:2}.get(state, 0)
+        combo_idx = {0:0, 1:1, 2:2, 3:3}.get(state, 0)
         if self.combo_mode.currentIndex() != combo_idx:
             self.combo_mode.blockSignals(True)
             self.combo_mode.setCurrentIndex(combo_idx)
             self.combo_mode.blockSignals(False)
 
     def on_mode_changed(self, idx: int):
-        mapping = {0: 1, 1: 2, 2: 3}
-        self._param_state = mapping.get(idx, 1)
+        mapping = {0: 0, 1: 1, 2: 2, 3: 3}
+        self._param_state = mapping.get(idx, 0)
         self._apply_state(self._param_state)
         self._on_cut_param_changed()
 
@@ -1557,7 +1564,7 @@ class Cutter(QMainWindow):
     # ------------------------------- cutter -------------------------------
     def _resolve_cut_params_for_video(self, fps: float, total_frames: int):
         """Return ({start_sec, dur_sec, duration_truncated}, None) or (None, error_text)."""
-        state = getattr(self, "_param_state", 1)  # 1=S+D, 2=D+E, 3=S+E
+        state = getattr(self, "_param_state", 0)  # 0=off, 1=S+D, 2=D+E, 3=S+E
         have_s = state in (1, 3)
         have_d = state in (1, 2)
         have_e = state in (2, 3)
@@ -1566,6 +1573,13 @@ class Cutter(QMainWindow):
         total_sec = total_frames / fps
         if total_sec <= 0:
             return None, "Video duration is not available."
+        if state == 0:
+            return {
+                "start_sec": 0.0,
+                "dur_sec": total_sec,
+                "requested_dur_sec": total_sec,
+                "duration_truncated": False,
+            }, None
 
         # read inputs
         try:
