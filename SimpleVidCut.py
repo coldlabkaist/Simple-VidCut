@@ -17,6 +17,34 @@ import cv2
 import numpy as np
 
 
+def _quiet_opencv_logging():
+    # Random access on some H.264 files can produce noisy decoder warnings on stderr.
+    try:
+        if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
+            log_api = cv2.utils.logging
+            if hasattr(log_api, "setLogLevel"):
+                level = getattr(log_api, "LOG_LEVEL_SILENT", None)
+                if level is None:
+                    level = getattr(log_api, "LOG_LEVEL_ERROR", None)
+                if level is not None:
+                    log_api.setLogLevel(level)
+                    return
+    except Exception:
+        pass
+    try:
+        if hasattr(cv2, "setLogLevel"):
+            level = getattr(cv2, "LOG_LEVEL_SILENT", None)
+            if level is None:
+                level = getattr(cv2, "LOG_LEVEL_ERROR", None)
+            if level is not None:
+                cv2.setLogLevel(level)
+    except Exception:
+        pass
+
+
+_quiet_opencv_logging()
+
+
 def _resource_base_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -63,36 +91,41 @@ class VideoThread(QThread):
         return True
 
     def run(self):
-        if not self.cap:
-            ok = self.open()
-            if not ok:
-                self.finished.emit()
-                return
-        frame_interval_ms = lambda: max(1, int(1000.0 / self.fps / max(0.1, self.speed)))
-        while not self._stop:
-            if self._seek_to is not None:
-                idx = max(0, min(self._seek_to, max(0, self.total - 1)))
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                self.current_idx = idx
-                self._seek_to = None
-                if not self.playing:
-                    ret, frame = self.cap.read()
-                    if ret:
-                        self._emit_frame(frame)
-                    self.msleep(1)
-            if self.playing:
-                ret, frame = self.cap.read()
-                if not ret:
-                    self.playing = False
+        try:
+            if not self.cap:
+                ok = self.open()
+                if not ok:
                     self.finished.emit()
-                    self.msleep(20)
-                    continue
-                self._emit_frame(frame)
-                self.current_idx += 1
-                self.msleep(frame_interval_ms())
-            else:
-                # idle wait
-                self.msleep(15)
+                    return
+            frame_interval_ms = lambda: max(1, int(1000.0 / self.fps / max(0.1, self.speed)))
+            while not self._stop:
+                if self._seek_to is not None:
+                    idx = max(0, min(self._seek_to, max(0, self.total - 1)))
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    self.current_idx = idx
+                    self._seek_to = None
+                    if not self.playing:
+                        ret, frame = self.cap.read()
+                        if ret:
+                            self._emit_frame(frame)
+                        self._sleep_with_stop(1)
+                if self.playing:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        self.playing = False
+                        self.finished.emit()
+                        self._sleep_with_stop(20)
+                        continue
+                    self._emit_frame(frame)
+                    self.current_idx += 1
+                    self._sleep_with_stop(frame_interval_ms())
+                else:
+                    # idle wait
+                    self._sleep_with_stop(15)
+        finally:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
 
     def _apply_adjustments(self, frame):
         c = float(self.contrast)
@@ -150,6 +183,14 @@ class VideoThread(QThread):
     def stop(self):
         self._stop = True
         self.playing = False
+        self._seek_to = None
+
+    def _sleep_with_stop(self, total_ms: int):
+        remaining = max(0, int(total_ms))
+        while remaining > 0 and not self._stop:
+            step = min(remaining, 20)
+            self.msleep(step)
+            remaining -= step
 
 
 class ClickJumpSlider(QSlider):
@@ -354,11 +395,13 @@ class ExportThread(QThread):
         self.cmd = list(cmd)
         self.out_path = out_path
         self.duration_us = max(1, int(max(0.001, float(duration_sec)) * 1_000_000.0))
+        self.proc = None
+        self._stop = False
 
     def run(self):
         err_tail: List[str] = []
         try:
-            proc = subprocess.Popen(
+            self.proc = subprocess.Popen(
                 self.cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -368,8 +411,11 @@ class ExportThread(QThread):
                 bufsize=1,
             )
             self.progressChanged.emit(0)
-            if proc.stderr:
-                for raw in proc.stderr:
+            if self.proc.stderr:
+                for raw in self.proc.stderr:
+                    if self._stop:
+                        self._terminate_proc()
+                        break
                     line = (raw or "").strip()
                     if not line:
                         continue
@@ -388,7 +434,9 @@ class ExportThread(QThread):
                         err_tail.append(line)
                         if len(err_tail) > 120:
                             err_tail = err_tail[-120:]
-            rc = proc.wait()
+            rc = self.proc.wait()
+            if self._stop:
+                return
             if rc != 0:
                 msg = "\n".join(err_tail[-60:]) if err_tail else f"ffmpeg exited with code {rc}"
                 self.failed.emit(msg)
@@ -396,7 +444,25 @@ class ExportThread(QThread):
             self.progressChanged.emit(100)
             self.finishedOk.emit(self.out_path)
         except Exception as e:
-            self.failed.emit(f"Failed to run ffmpeg: {e}")
+            if not self._stop:
+                self.failed.emit(f"Failed to run ffmpeg: {e}")
+        finally:
+            self.proc = None
+
+    def stop(self):
+        self._stop = True
+        self._terminate_proc()
+
+    def _terminate_proc(self):
+        proc = self.proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 class BatchExportThread(QThread):
@@ -407,11 +473,13 @@ class BatchExportThread(QThread):
     def __init__(self, tasks: List[dict]):
         super().__init__()
         self.tasks = list(tasks)
+        self.proc = None
+        self._stop = False
 
     def _run_one(self, cmd: List[str], duration_us: int):
         err_tail: List[str] = []
         try:
-            proc = subprocess.Popen(
+            self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -421,8 +489,11 @@ class BatchExportThread(QThread):
                 bufsize=1,
             )
             self.progressChanged.emit(0)
-            if proc.stderr:
-                for raw in proc.stderr:
+            if self.proc.stderr:
+                for raw in self.proc.stderr:
+                    if self._stop:
+                        self._terminate_proc()
+                        return False, ""
                     line = (raw or "").strip()
                     if not line:
                         continue
@@ -441,14 +512,20 @@ class BatchExportThread(QThread):
                         err_tail.append(line)
                         if len(err_tail) > 120:
                             err_tail = err_tail[-120:]
-            rc = proc.wait()
+            rc = self.proc.wait()
+            if self._stop:
+                return False, ""
             if rc != 0:
                 msg = "\n".join(err_tail[-60:]) if err_tail else f"ffmpeg exited with code {rc}"
                 return False, msg
             self.progressChanged.emit(100)
             return True, ""
         except Exception as e:
+            if self._stop:
+                return False, ""
             return False, f"Failed to run ffmpeg: {e}"
+        finally:
+            self.proc = None
 
     def run(self):
         total = len(self.tasks)
@@ -458,9 +535,13 @@ class BatchExportThread(QThread):
 
         failures: List[str] = []
         for i, task in enumerate(self.tasks, start=1):
+            if self._stop:
+                return
             label = task.get("label", f"item {i}")
             self.itemChanged.emit(i, total, label)
             ok, err = self._run_one(task["cmd"], int(task["duration_us"]))
+            if self._stop:
+                return
             if not ok:
                 failures.append(f"[{label}] {err}")
 
@@ -473,6 +554,21 @@ class BatchExportThread(QThread):
             return
 
         self.done.emit(f"Batch export completed: {total}/{total} succeeded.", False)
+
+    def stop(self):
+        self._stop = True
+        self._terminate_proc()
+
+    def _terminate_proc(self):
+        proc = self.proc
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
 
 
 # ------------------------------ Main Window ------------------------------
@@ -504,6 +600,8 @@ class Cutter(QMainWindow):
         self.loaded_video_name: Optional[str] = None
         self.export_thread: Optional[ExportThread] = None
         self.batch_export_thread: Optional[BatchExportThread] = None
+        self._closing = False
+        self._close_retry_scheduled = False
 
         # ---------- UI ----------
         root = QWidget(self); self.setCentralWidget(root)
@@ -1396,6 +1494,9 @@ class Cutter(QMainWindow):
     # --------------------------- playback handlers ---------------------------
     @pyqtSlot(QImage, int)
     def on_frame(self, qimg: QImage, idx: int):
+        if self.slider.isSliderDown():
+            self.video_preview.set_frame(qimg)
+            return
         self.current_frame = idx
         self.slider.blockSignals(True)
         self.slider.setValue(idx)
@@ -1440,10 +1541,14 @@ class Cutter(QMainWindow):
 
     def on_slider_moved(self, pos: int):
         if not self.thread: return
+        self.current_frame = int(pos)
+        self.update_labels()
         self.thread.seek(int(pos))
 
     def on_slider_released(self):
         if not self.thread: return
+        self.current_frame = int(self.slider.value())
+        self.update_labels()
         self.thread.seek(int(self.slider.value()))
         if self.scrub_was_playing:
             self.thread.play()
@@ -1766,11 +1871,17 @@ class Cutter(QMainWindow):
         self.status_progress.setValue(max(0, min(100, int(pct))))
 
     def _on_export_finished(self, out_path: str):
+        if self._closing:
+            self.export_thread = None
+            return
         self._set_export_running(False)
         self._set_export_status(f"Saved: {out_path}", tooltip=out_path, auto_clear_ms=6000)
         self.export_thread = None
 
     def _on_export_failed(self, err_text: str):
+        if self._closing:
+            self.export_thread = None
+            return
         self._set_export_running(False)
         QMessageBox.critical(self, "ffmpeg error", (err_text or "")[-8000:])
         self._set_export_status("Export failed. See error dialog.", auto_clear_ms=6000)
@@ -1791,6 +1902,9 @@ class Cutter(QMainWindow):
         self._set_progress_context(f"{idx}/{total}  {label}")
 
     def _on_batch_done(self, summary: str, has_errors: bool):
+        if self._closing:
+            self.batch_export_thread = None
+            return
         self._set_export_running(False)
         self.batch_export_thread = None
         if has_errors:
@@ -2027,15 +2141,45 @@ class Cutter(QMainWindow):
         self._start_export_thread(cmd, out_path, dur_sec)
 
     # ------------------------------ close ------------------------------
-    def closeEvent(self, e):
-        if self.export_thread and self.export_thread.isRunning():
-            self.export_thread.wait(300)
-        if self.batch_export_thread and self.batch_export_thread.isRunning():
-            self.batch_export_thread.wait(300)
+    def _request_background_stop(self):
+        if self.export_thread:
+            self.export_thread.stop()
+        if self.batch_export_thread:
+            self.batch_export_thread.stop()
         if self.thread:
             self.thread.stop()
-            self.thread.wait(300)
-        super().closeEvent(e)
+
+    def _background_threads_stopped(self) -> bool:
+        alive = False
+        for thread in (self.export_thread, self.batch_export_thread, self.thread):
+            if thread and thread.isRunning():
+                thread.wait(50)
+                if thread.isRunning():
+                    alive = True
+        if self.export_thread and not self.export_thread.isRunning():
+            self.export_thread = None
+        if self.batch_export_thread and not self.batch_export_thread.isRunning():
+            self.batch_export_thread = None
+        if self.thread and not self.thread.isRunning():
+            self.thread = None
+        return not alive
+
+    def _retry_close(self):
+        self._close_retry_scheduled = False
+        if self.isVisible():
+            self.close()
+
+    def closeEvent(self, e):
+        self._closing = True
+        self._request_background_stop()
+        if self._background_threads_stopped():
+            super().closeEvent(e)
+            return
+        self._set_export_status("Closing: waiting for background tasks to stop...")
+        e.ignore()
+        if not self._close_retry_scheduled:
+            self._close_retry_scheduled = True
+            QTimer.singleShot(100, self._retry_close)
 
 
 def main():
