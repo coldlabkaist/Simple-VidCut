@@ -59,7 +59,7 @@ def _find_app_icon_path() -> str:
 # ---------------------------- Video worker thread ----------------------------
 class VideoThread(QThread):
     frameReady = pyqtSignal(QImage, int)   # image, frame_index
-    finished   = pyqtSignal()
+    playbackEnded = pyqtSignal()
 
     def __init__(self, path: str):
         super().__init__()
@@ -96,7 +96,7 @@ class VideoThread(QThread):
             if not self.cap:
                 ok = self.open()
                 if not ok:
-                    self.finished.emit()
+                    self.playbackEnded.emit()
                     return
             frame_interval_s = lambda: max(0.001, 1.0 / self.fps / max(0.1, self.speed))
             while not self._stop:
@@ -116,7 +116,7 @@ class VideoThread(QThread):
                     if not ret:
                         self.playing = False
                         self._reset_playback_timing()
-                        self.finished.emit()
+                        self.playbackEnded.emit()
                         self._sleep_with_stop(20)
                         continue
                     self._emit_frame(frame)
@@ -623,6 +623,9 @@ class Cutter(QMainWindow):
         self.batch_export_thread: Optional[BatchExportThread] = None
         self._closing = False
         self._close_retry_scheduled = False
+        self._close_retry_count = 0
+        self._export_result_received = False
+        self._batch_result_received = False
 
         # ---------- UI ----------
         root = QWidget(self); self.setCentralWidget(root)
@@ -1498,7 +1501,7 @@ class Cutter(QMainWindow):
 
         # connect signals
         self.thread.frameReady.connect(self.on_frame)
-        self.thread.finished.connect(self.on_video_finished)
+        self.thread.playbackEnded.connect(self.on_video_finished)
         self.thread.start()
         self.thread.set_adjustments(*self._current_adjustments())
 
@@ -1893,30 +1896,53 @@ class Cutter(QMainWindow):
 
     def _on_export_finished(self, out_path: str):
         if self._closing:
-            self.export_thread = None
             return
         self._set_export_running(False)
         self._set_export_status(f"Saved: {out_path}", tooltip=out_path, auto_clear_ms=6000)
-        self.export_thread = None
+        self._export_result_received = True
 
     def _on_export_failed(self, err_text: str):
         if self._closing:
-            self.export_thread = None
             return
         self._set_export_running(False)
         QMessageBox.critical(self, "ffmpeg error", (err_text or "")[-8000:])
         self._set_export_status("Export failed. See error dialog.", auto_clear_ms=6000)
-        self.export_thread = None
+        self._export_result_received = True
+
+    def _finalize_export_thread_state(self):
+        if self.export_thread is not None or self._closing:
+            self._export_result_received = False
+            return
+        if not self._export_result_received:
+            self._set_export_running(False)
+            QMessageBox.warning(
+                self,
+                "Export warning",
+                "The export worker stopped without sending a completion message.\n\n"
+                "The output file may be incomplete. Please retry if needed."
+            )
+            self._set_export_status("Export worker stopped unexpectedly.", auto_clear_ms=8000)
+        self._export_result_received = False
+
+    def _on_export_thread_finished(self):
+        thread = self.sender()
+        if thread is self.export_thread:
+            self.export_thread = None
+            QTimer.singleShot(0, self._finalize_export_thread_state)
+        if thread is not None:
+            thread.deleteLater()
 
     def _start_export_thread(self, cmd: List[str], out_path: str, dur_sec: float):
         self._set_export_running(True)
         self.status_progress.setValue(0)
         self._set_export_status("Processing video...")
         self._set_progress_context(f"1/1  {os.path.basename(self.video_path or out_path)}")
+        self._export_result_received = False
         self.export_thread = ExportThread(cmd, out_path, dur_sec)
         self.export_thread.progressChanged.connect(self._on_export_progress)
         self.export_thread.finishedOk.connect(self._on_export_finished)
         self.export_thread.failed.connect(self._on_export_failed)
+        self.export_thread.finished.connect(self._on_export_thread_finished)
         self.export_thread.start()
 
     def _on_batch_item_changed(self, idx: int, total: int, label: str):
@@ -1924,24 +1950,48 @@ class Cutter(QMainWindow):
 
     def _on_batch_done(self, summary: str, has_errors: bool):
         if self._closing:
-            self.batch_export_thread = None
             return
         self._set_export_running(False)
-        self.batch_export_thread = None
+        self._batch_result_received = True
         if has_errors:
             QMessageBox.warning(self, "Batch export", summary[-8000:])
             self._set_export_status("Batch export completed with errors.", auto_clear_ms=8000)
         else:
             self._set_export_status(summary, auto_clear_ms=8000)
 
+    def _finalize_batch_thread_state(self):
+        if self.batch_export_thread is not None or self._closing:
+            self._batch_result_received = False
+            return
+        if not self._batch_result_received:
+            self._set_export_running(False)
+            QMessageBox.warning(
+                self,
+                "Batch export warning",
+                "The batch export worker stopped without sending a completion message.\n\n"
+                "Some output files may be incomplete. Please verify the results and retry if needed."
+            )
+            self._set_export_status("Batch export worker stopped unexpectedly.", auto_clear_ms=8000)
+        self._batch_result_received = False
+
+    def _on_batch_thread_finished(self):
+        thread = self.sender()
+        if thread is self.batch_export_thread:
+            self.batch_export_thread = None
+            QTimer.singleShot(0, self._finalize_batch_thread_state)
+        if thread is not None:
+            thread.deleteLater()
+
     def _start_batch_export_thread(self, tasks: List[dict]):
         self._set_export_running(True)
         self.status_progress.setValue(0)
         self._set_export_status("Processing selected videos...")
+        self._batch_result_received = False
         self.batch_export_thread = BatchExportThread(tasks)
         self.batch_export_thread.itemChanged.connect(self._on_batch_item_changed)
         self.batch_export_thread.progressChanged.connect(self._on_export_progress)
         self.batch_export_thread.done.connect(self._on_batch_done)
+        self.batch_export_thread.finished.connect(self._on_batch_thread_finished)
         self.batch_export_thread.start()
 
     def open_batch_export_dialog(self):
@@ -2185,6 +2235,16 @@ class Cutter(QMainWindow):
             self.thread = None
         return not alive
 
+    def _alive_background_task_names(self) -> List[str]:
+        names: List[str] = []
+        if self.export_thread and self.export_thread.isRunning():
+            names.append("export")
+        if self.batch_export_thread and self.batch_export_thread.isRunning():
+            names.append("batch export")
+        if self.thread and self.thread.isRunning():
+            names.append("video preview")
+        return names
+
     def _retry_close(self):
         self._close_retry_scheduled = False
         if self.isVisible():
@@ -2194,9 +2254,15 @@ class Cutter(QMainWindow):
         self._closing = True
         self._request_background_stop()
         if self._background_threads_stopped():
+            self._close_retry_count = 0
             super().closeEvent(e)
             return
-        self._set_export_status("Closing: waiting for background tasks to stop...")
+        self._close_retry_count += 1
+        active = ", ".join(self._alive_background_task_names()) or "background task"
+        msg = f"Closing: waiting for {active} to stop."
+        if self._close_retry_count >= 10:
+            msg += " If this keeps repeating, a worker thread may be stuck."
+        self._set_export_status(msg)
         e.ignore()
         if not self._close_retry_scheduled:
             self._close_retry_scheduled = True
