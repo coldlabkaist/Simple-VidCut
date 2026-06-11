@@ -1,4 +1,4 @@
-import sys, os, shutil, subprocess, math
+import sys, os, shutil, subprocess, math, time
 from typing import Optional, List
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QEvent, QTimer, QRect, QSize
 from PyQt5.QtGui import QImage, QPixmap, QIntValidator, QIcon, QColor, QKeySequence, QPainter, QPen
@@ -77,6 +77,7 @@ class VideoThread(QThread):
         self._seek_to: Optional[int] = None
         self.current_idx = 0
         self._stop = False
+        self._next_frame_deadline: Optional[float] = None
 
     def open(self) -> bool:
         self.cap = cv2.VideoCapture(self.path)
@@ -97,13 +98,14 @@ class VideoThread(QThread):
                 if not ok:
                     self.finished.emit()
                     return
-            frame_interval_ms = lambda: max(1, int(1000.0 / self.fps / max(0.1, self.speed)))
+            frame_interval_s = lambda: max(0.001, 1.0 / self.fps / max(0.1, self.speed))
             while not self._stop:
                 if self._seek_to is not None:
                     idx = max(0, min(self._seek_to, max(0, self.total - 1)))
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                     self.current_idx = idx
                     self._seek_to = None
+                    self._reset_playback_timing()
                     if not self.playing:
                         ret, frame = self.cap.read()
                         if ret:
@@ -113,13 +115,24 @@ class VideoThread(QThread):
                     ret, frame = self.cap.read()
                     if not ret:
                         self.playing = False
+                        self._reset_playback_timing()
                         self.finished.emit()
                         self._sleep_with_stop(20)
                         continue
                     self._emit_frame(frame)
                     self.current_idx += 1
-                    self._sleep_with_stop(frame_interval_ms())
+                    interval_s = frame_interval_s()
+                    now = time.perf_counter()
+                    if self._next_frame_deadline is None:
+                        self._next_frame_deadline = now + interval_s
+                    else:
+                        self._next_frame_deadline += interval_s
+                        if self._next_frame_deadline < now - interval_s:
+                            self._next_frame_deadline = now
+                    remaining_ms = max(0, int((self._next_frame_deadline - time.perf_counter()) * 1000.0))
+                    self._sleep_with_stop(remaining_ms)
                 else:
+                    self._reset_playback_timing()
                     # idle wait
                     self._sleep_with_stop(15)
         finally:
@@ -159,15 +172,18 @@ class VideoThread(QThread):
 
     @pyqtSlot()
     def play(self):
+        self._reset_playback_timing()
         self.playing = True
 
     @pyqtSlot()
     def pause(self):
         self.playing = False
+        self._reset_playback_timing()
 
     @pyqtSlot(float)
     def set_speed(self, s: float):
         self.speed = max(0.1, float(s))
+        self._reset_playback_timing()
 
     @pyqtSlot(float, float, float)
     def set_adjustments(self, contrast: float, brightness: float, saturation: float):
@@ -178,12 +194,17 @@ class VideoThread(QThread):
     @pyqtSlot(int)
     def seek(self, frame_idx: int):
         self._seek_to = int(frame_idx)
+        self._reset_playback_timing()
 
     @pyqtSlot()
     def stop(self):
         self._stop = True
         self.playing = False
         self._seek_to = None
+        self._reset_playback_timing()
+
+    def _reset_playback_timing(self):
+        self._next_frame_deadline = None
 
     def _sleep_with_stop(self, total_ms: int):
         remaining = max(0, int(total_ms))
