@@ -238,6 +238,7 @@ class CropPreviewWidget(QWidget):
         self._frame = QImage()
         self._crop_state = "off"
         self._crop_rect = None
+        self._fixed_crop_norm_size = None
         self._drag_start = None
         self._drag_current = None
         self._dragging = False
@@ -268,6 +269,18 @@ class CropPreviewWidget(QWidget):
 
     def set_crop_rect(self, rect_norm):
         self._crop_rect = rect_norm
+        self.update()
+
+    def set_fixed_crop_size(self, size_norm):
+        if size_norm is None:
+            self._fixed_crop_norm_size = None
+        else:
+            width = float(size_norm[0])
+            height = float(size_norm[1])
+            self._fixed_crop_norm_size = (
+                max(0.0, min(1.0, width)),
+                max(0.0, min(1.0, height)),
+            )
         self.update()
 
     def _clear_drag(self):
@@ -320,6 +333,21 @@ class CropPreviewWidget(QWidget):
             return None
         return (left, top, right, bottom)
 
+    def _fixed_norm_rect_at(self, point):
+        if point is None or self._fixed_crop_norm_size is None:
+            return None
+        width, height = self._fixed_crop_norm_size
+        if width <= 0.0 or height <= 0.0 or width > 1.0 or height > 1.0:
+            return None
+        center_x = max(width / 2.0, min(1.0 - width / 2.0, point[0]))
+        center_y = max(height / 2.0, min(1.0 - height / 2.0, point[1]))
+        return (
+            center_x - width / 2.0,
+            center_y - height / 2.0,
+            center_x + width / 2.0,
+            center_y + height / 2.0,
+        )
+
     def _norm_rect_to_widget_rect(self, rect_norm):
         rect = self._content_rect()
         if not rect.isValid() or rect.width() <= 0 or rect.height() <= 0 or not rect_norm:
@@ -340,6 +368,8 @@ class CropPreviewWidget(QWidget):
 
     def _current_overlay_rect(self):
         if self._dragging:
+            if self._fixed_crop_norm_size is not None:
+                return self._fixed_norm_rect_at(self._drag_current)
             return self._norm_rect_from_points(self._drag_start, self._drag_current)
         return self._crop_rect
 
@@ -395,7 +425,9 @@ class CropPreviewWidget(QWidget):
             if norm is not None:
                 self._drag_current = norm
             rect_norm = None
-            if self._drag_distance_large_enough():
+            if self._fixed_crop_norm_size is not None:
+                rect_norm = self._fixed_norm_rect_at(self._drag_current)
+            elif self._drag_distance_large_enough():
                 rect_norm = self._norm_rect_from_points(self._drag_start, self._drag_current)
             self._clear_drag()
             self.update()
@@ -710,8 +742,28 @@ class Cutter(QMainWindow):
         self.lbl_crop_status = QLabel("Off")
         self.lbl_crop_status.setStyleSheet("color: #4c566a;")
         self.lbl_crop_status.setWordWrap(True)
+        self.chk_crop_fixed = QCheckBox('Fixed pixel size')
+        self.spn_crop_width = QSpinBox()
+        self.spn_crop_width.setRange(4, 32768)
+        self.spn_crop_width.setSingleStep(2)
+        self.spn_crop_width.setValue(1920)
+        self.spn_crop_width.setSuffix(' px')
+        self.spn_crop_height = QSpinBox()
+        self.spn_crop_height.setRange(4, 32768)
+        self.spn_crop_height.setSingleStep(2)
+        self.spn_crop_height.setValue(1080)
+        self.spn_crop_height.setSuffix(' px')
+        crop_size_row = QHBoxLayout()
+        crop_size_row.setContentsMargins(0, 0, 0, 0)
+        crop_size_row.addWidget(QLabel('W'))
+        crop_size_row.addWidget(self.spn_crop_width)
+        crop_size_row.addWidget(QLabel('x'))
+        crop_size_row.addWidget(QLabel('H'))
+        crop_size_row.addWidget(self.spn_crop_height)
         gcr.addWidget(self.btn_crop, 0, 0)
         gcr.addWidget(self.lbl_crop_status, 0, 1)
+        gcr.addWidget(self.chk_crop_fixed, 1, 0, 1, 2)
+        gcr.addLayout(crop_size_row, 2, 0, 1, 2)
         gcr.setColumnStretch(1, 1)
 
         # right: file list + cut params + run
@@ -891,6 +943,7 @@ class Cutter(QMainWindow):
         self.sld_saturation.valueChanged.connect(lambda _: self._on_adjustment_changed())
         self.btn_adjust_reset.clicked.connect(self.reset_adjustments)
         self.btn_crop.clicked.connect(self.toggle_crop_mode)
+        self.chk_crop_fixed.toggled.connect(self._on_fixed_crop_toggled)
         self.btn_export_dir.clicked.connect(self.choose_export_folder)
 
         # param toggles
@@ -1100,6 +1153,36 @@ class Cutter(QMainWindow):
     def _crop_active(self) -> bool:
         return self.crop_state == "active" and self.crop_norm_rect is not None
 
+    def _requested_fixed_crop_size(self):
+        if not self.chk_crop_fixed.isChecked():
+            return None
+        return int(self.spn_crop_width.value()), int(self.spn_crop_height.value())
+
+    def _fixed_crop_size_error(self, video_width: int, video_height: int):
+        fixed_size = self._requested_fixed_crop_size()
+        if fixed_size is None:
+            return None
+        width, height = fixed_size
+        if width < 4 or height < 4:
+            return 'Fixed crop width and height must be at least 4 pixels.'
+        if width % 2 or height % 2:
+            return 'Fixed crop width and height must be even for video compatibility.'
+        if video_width <= 0 or video_height <= 0:
+            return 'Fixed crop size cannot be checked until the video dimensions are available.'
+        if width > int(video_width) or height > int(video_height):
+            return f'Fixed crop {width}x{height} is larger than the video ({video_width}x{video_height}).'
+        return None
+
+    def _crop_rect_to_norm(self, crop_rect, video_width: int, video_height: int):
+        if not crop_rect or video_width <= 0 or video_height <= 0:
+            return None
+        return (
+            crop_rect['x'] / float(video_width),
+            crop_rect['y'] / float(video_height),
+            (crop_rect['x'] + crop_rect['w']) / float(video_width),
+            (crop_rect['y'] + crop_rect['h']) / float(video_height),
+        )
+
     def _normalize_crop_rect(self, rect_norm):
         if not rect_norm:
             return None
@@ -1119,6 +1202,22 @@ class Cutter(QMainWindow):
         video_height = int(video_height)
         if video_width <= 1 or video_height <= 1:
             return None, "Crop canceled: video size is unavailable."
+
+        fixed_size = self._requested_fixed_crop_size()
+        if fixed_size is not None:
+            fixed_error = self._fixed_crop_size_error(video_width, video_height)
+            if fixed_error:
+                return None, fixed_error
+            width, height = fixed_size
+            center_x = ((rect_norm[0] + rect_norm[2]) / 2.0) * video_width
+            center_y = ((rect_norm[1] + rect_norm[3]) / 2.0) * video_height
+            left = int(round(center_x - width / 2.0))
+            top = int(round(center_y - height / 2.0))
+            left = max(0, min(left, video_width - width))
+            top = max(0, min(top, video_height - height))
+            left -= left % 2
+            top -= top % 2
+            return {'x': left, 'y': top, 'w': width, 'h': height}, None
 
         left = max(0, min(int(round(rect_norm[0] * video_width)), video_width - 1))
         top = max(0, min(int(round(rect_norm[1] * video_height)), video_height - 1))
@@ -1163,7 +1262,24 @@ class Cutter(QMainWindow):
         else:
             self.btn_crop.setText("Crop")
             self.btn_crop.setToolTip("Enter crop selection mode.")
-            self.lbl_crop_status.setText("Off")
+            fixed_size = self._requested_fixed_crop_size()
+            if fixed_size:
+                fixed_error = self._fixed_crop_size_error(self.video_width, self.video_height)
+                self.lbl_crop_status.setText(fixed_error or f'Ready: {fixed_size[0]}x{fixed_size[1]} px')
+            else:
+                self.lbl_crop_status.setText('Off')
+        fixed_size = self._requested_fixed_crop_size()
+        if fixed_size and self.video_width > 0 and self.video_height > 0:
+            self.video_preview.set_fixed_crop_size((
+                fixed_size[0] / float(self.video_width),
+                fixed_size[1] / float(self.video_height),
+            ))
+        else:
+            self.video_preview.set_fixed_crop_size(None)
+        crop_settings_enabled = bool(self.video_path) and self.crop_state == 'off'
+        self.chk_crop_fixed.setEnabled(crop_settings_enabled)
+        self.spn_crop_width.setEnabled(crop_settings_enabled and self.chk_crop_fixed.isChecked())
+        self.spn_crop_height.setEnabled(crop_settings_enabled and self.chk_crop_fixed.isChecked())
         self.video_preview.set_crop_rect(self.crop_norm_rect)
         self.video_preview.set_crop_state(self.crop_state)
 
@@ -1189,14 +1305,26 @@ class Cutter(QMainWindow):
     def _revalidate_crop_for_current_video(self, status_text: str = ""):
         if not self._crop_active():
             return True
-        _, err = self._validated_crop_rect_for_size(self.video_width, self.video_height)
+        crop_rect, err = self._validated_crop_rect_for_size(self.video_width, self.video_height)
         if err:
-            self._clear_crop_selection(status_text or err)
+            message = err if self._requested_fixed_crop_size() else (status_text or err)
+            self._clear_crop_selection(message)
             return False
-        self.video_preview.set_crop_rect(self.crop_norm_rect)
+        self.crop_norm_rect = self._crop_rect_to_norm(crop_rect, self.video_width, self.video_height)
+        self._update_crop_button()
         return True
 
+    def _on_fixed_crop_toggled(self, checked: bool):
+        self.spn_crop_width.setEnabled(bool(checked) and bool(self.video_path))
+        self.spn_crop_height.setEnabled(bool(checked) and bool(self.video_path))
+        self._update_crop_button()
+
     def toggle_crop_mode(self):
+        if self.crop_state == 'off':
+            fixed_error = self._fixed_crop_size_error(self.video_width, self.video_height)
+            if fixed_error:
+                self._set_export_status(fixed_error, auto_clear_ms=6000)
+                return
         if not self.video_path:
             self._set_export_status("Load a video before using crop.", auto_clear_ms=4000)
             return
@@ -1204,7 +1332,14 @@ class Cutter(QMainWindow):
             self.crop_state = "armed"
             self._update_crop_button()
             self._sync_export_mode_for_adjustments()
-            self._set_export_status("Crop mode: drag on the preview to select an area.", auto_clear_ms=5000)
+            fixed_size = self._requested_fixed_crop_size()
+            if fixed_size:
+                self._set_export_status(
+                    f'Fixed crop mode: click or drag to position {fixed_size[0]}x{fixed_size[1]} px.',
+                    auto_clear_ms=6000,
+                )
+            else:
+                self._set_export_status('Crop mode: drag on the preview to select an area.', auto_clear_ms=5000)
             return
         if self.crop_state == "armed":
             self._clear_crop_selection("Crop selection canceled.")
@@ -1218,6 +1353,7 @@ class Cutter(QMainWindow):
         if err:
             self._clear_crop_selection(err)
             return
+        rect_norm = self._crop_rect_to_norm(crop_rect, self.video_width, self.video_height)
         self._activate_crop_selection(
             rect_norm,
             f"Crop applied: {crop_rect['w']}x{crop_rect['h']} at ({crop_rect['x']}, {crop_rect['y']})."
@@ -1417,6 +1553,10 @@ class Cutter(QMainWindow):
                   self.spn_contrast, self.spn_brightness, self.spn_saturation,
                   self.btn_adjust_reset, self.btn_crop):
             w.setEnabled(video_loaded)
+        crop_settings_enabled = video_loaded and self.crop_state == 'off'
+        self.chk_crop_fixed.setEnabled(crop_settings_enabled)
+        self.spn_crop_width.setEnabled(crop_settings_enabled and self.chk_crop_fixed.isChecked())
+        self.spn_crop_height.setEnabled(crop_settings_enabled and self.chk_crop_fixed.isChecked())
 
         # enforce the 2-of-3 rule even when enabling
         self._apply_state(getattr(self, "_param_state", 0))
@@ -1488,6 +1628,11 @@ class Cutter(QMainWindow):
         self.total_frames = self.thread.total
         self.video_width = self.thread.width
         self.video_height = self.thread.height
+        if not self.chk_crop_fixed.isChecked():
+            even_width = max(4, self.video_width - (self.video_width % 2))
+            even_height = max(4, self.video_height - (self.video_height % 2))
+            self.spn_crop_width.setValue(even_width)
+            self.spn_crop_height.setValue(even_height)
         self.slider.setRange(0, max(0, self.total_frames-1))
         self.slider.setValue(0)
         self.current_frame = 0
@@ -2099,10 +2244,14 @@ class Cutter(QMainWindow):
 
         if self._crop_active():
             for item in prepared_items:
-                _, crop_err = self._crop_filter_for_size(item["video_width"], item["video_height"])
+                _, crop_err = self._crop_filter_for_size(item['video_width'], item['video_height'])
                 if crop_err:
-                    self._clear_crop_selection("Crop canceled: selection is too small for one or more videos.")
-                    break
+                    QMessageBox.warning(
+                        self,
+                        'Invalid crop',
+                        'Cannot crop {}:\n{}'.format(item['label'], crop_err),
+                    )
+                    return
 
         for item in prepared_items:
             cmd, _ = self._build_export_command(
@@ -2179,7 +2328,9 @@ class Cutter(QMainWindow):
         if self._crop_active():
             _, crop_err = self._crop_filter_for_size(self.video_width, self.video_height)
             if crop_err:
-                self._clear_crop_selection(crop_err)
+                QMessageBox.warning(self, 'Invalid crop', crop_err)
+                self._set_export_status(crop_err, auto_clear_ms=6000)
+                return
 
         out_path = self._make_output_path(self.video_path)
 
